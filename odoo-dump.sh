@@ -4,6 +4,12 @@
 # Set these variables before running the script
 BACKUP_DIR="/tmp/odoo_backups"
 
+# --- Dependencies Check ---
+# This script requires 'psql' for database queries and 'jq' for JSON manipulation.
+# Make sure they are installed on your system.
+command -v psql >/dev/null 2>&1 || { echo >&2 "Error: psql is not installed. Aborting."; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo >&2 "Error: jq is not installed. Aborting."; exit 1; }
+
 # --- Script Logic ---
 
 # Create a temporary directory for the backup contents
