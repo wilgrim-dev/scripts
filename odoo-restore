@@ -1,97 +1,105 @@
 #!/bin/bash
 
-# Exit script if command fails
-# -u stops the script on unset variables
-# -e stops the script on errors
-# -o pipefail stops the script if a pipe fails
+# Exit immediately if a command exits with a non-zero status.
 set -e
 
+# --- Configuration ---
+DB_TEMPLATE="template0"
 
-# Get script name
-SCRIPT=$(basename "$0")
-
-# Display Help
-Help() {
-  echo
-  echo "$SCRIPT"
-  echo
-  echo "Description: Restore odoo database."
-  echo "Syntax: $SCRIPT [-p|-d|-f|-h|-r|help]"
-  echo "Example: $SCRIPT -p secret -d odoo -f /tmp/odoo.zip -h https://odoo.example.org"
-  echo "options:"
-  echo "  -p    Odoo master password. Defaults to \$ODOO_MASTER_PASSWORD env var and 'admin'."
-  echo "  -d    Database name. Defaults to filename."
-  echo "  -f    Odoo database backup file. Defaults to '/var/tmp/odoo.zip'"
-  echo "  -h    Odoo host. Defaults to 'http://localhost:8069'"
-  echo "  -r    Replace existing database."  
-  echo "  help  Show $SCRIPT manual."
-  echo
+# --- Function to check if a database exists ---
+function db_exists() {
+  local dbname="$1"
+  # Connect to the 'postgres' database to check for existence of other databases.
+  psql --dbname=postgres -t -c "SELECT 1 FROM pg_database WHERE datname='$dbname'" | grep -q 1
 }
 
-# Show help and exit
-if [[ $1 == 'help' ]]; then
-    Help
-    exit
+# --- Main Script Logic ---
+
+DB_NAME="$1"
+DUMP_FILE="$2"
+
+if [ -z "$DB_NAME" ] || [ -z "$DUMP_FILE" ]; then
+    echo "Usage: $0 <database_name> <zip_file>"
+    exit 1
 fi
 
-# Initialise option flag with a false value
-REPLACE='false'
-
-# Process params
-while getopts ":r :p: :d: :f: :h:" opt; do
-  case $opt in
-    r) REPLACE='true'
-    ;;
-    h) ODOO_HOST="$OPTARG"
-    ;;
-    p) PASSWORD="$OPTARG"
-    ;;
-    d) DATABASE="$OPTARG"
-    ;;
-    f) FILE="$OPTARG"
-    ;;
-    \?) echo "Invalid option -$OPTARG" >&2
-    Help
-    ;;
-  esac
-done
-
-# Fallback to environment vars and default values
-: ${PASSWORD:=${ODOO_MASTER_PASSWORD:='admin'}}
-: ${FILE:='/var/tmp/odoo.zip'}
-: ${ODOO_HOST:='http://localhost:8069'}
-FILENAME=$(basename -- "$FILE")
-#: ${DATABASE:="${FILENAME%%.*}"}
-: ${DATABASE:="odoo14prod"}
-
-# Verify variables
-[[ "$ODOO_HOST" == http* ]]  || { echo "Parameter -h|host must start with 'http/s'" ; exit 1; }
-[[ "${FILENAME##*.}" != "zip" ]] && { echo "Parameter -f|filename must end with '.zip'" ; exit 1; }
-
-# Validate zip file
-unzip -q -t $FILE
-
-if $REPLACE; then
-  echo "Deleting Odoo database $DATABASE ..."
-
-  curl \
-    --silent \
-    -F "master_pwd=${PASSWORD}" \
-    -F "name=${DATABASE}" \
-    ${ODOO_HOST%/}/web/database/drop | grep -q -E 'Internal Server Error|Redirecting...'
+echo "Checking if database '$DB_NAME' already exists..."
+if db_exists "$DB_NAME"; then
+    read -p "Database '$DB_NAME' already exists. Do you want to drop it? (y/n): " -n 1 -r
+    echo # Move to a new line
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo "Dropping database '$DB_NAME'..."
+        dropdb "$DB_NAME"
+        echo "Database '$DB_NAME' dropped successfully."
+    else
+        echo "Aborted. The database was not dropped."
+        exit 1
+    fi
 fi
 
-# Start restore
-echo "Requesting restore for Odoo database $DATABASE ..."
+echo "Creating empty database '$DB_NAME'..."
+createdb "$DB_NAME" --template="$DB_TEMPLATE" --encoding=UTF8
 
-# Request restore with curl
-CURL=$(curl \
-  -F "master_pwd=$PASSWORD" \
-  -F "name=$DATABASE" \
-  -F backup_file=@$FILE \
-  -F 'copy=true' \
-  "${ODOO_HOST%/}/web/database/restore")
-  
-(echo $CURL | grep -q 'Redirecting...') || (echo "The restore failed:"; echo $CURL | grep error; exit 1)
+echo "Restoring data from '$DUMP_FILE'..."
 
-echo "The restore for Odoo database $DATABASE has finished."
+# Create a temporary directory for extraction
+TEMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TEMP_DIR"' EXIT  # Clean up the temp directory on exit
+
+# Check the file type and restore accordingly
+if [[ "$DUMP_FILE" == *.zip ]]; then
+    # Odoo dump with manifest.json, dump.sql, and filestore folder
+    echo "Processing Odoo zip dump..."
+    unzip -q "$DUMP_FILE" -d "$TEMP_DIR"
+
+    # Restore the SQL dump from the temporary directory
+    if [ ! -f "$TEMP_DIR/dump.sql" ]; then
+      echo "Error: 'dump.sql' not found in the zip file."
+      exit 1
+    fi
+    psql -q --dbname="$DB_NAME" -f "$TEMP_DIR/dump.sql"
+
+    # Handle filestore if it exists
+    if [ -d "$TEMP_DIR/filestore" ]; then
+        echo "Restoring filestore..."
+        # Get the destination path for the filestore.
+        # This is a simplified approach, you need to replace this with your actual Odoo filestore path.
+        # This path is typically defined in your Odoo configuration file.
+        # FILENAMES_PATH=$(psql -t -q -c "SELECT value FROM ir_attachment_metadata WHERE key = 'filestore'" -d "$DB_NAME" | xargs)
+
+
+        # A more robust approach is to manually specify the path
+        # For example: FILENAMES_PATH="/path/to/your/odoo/data/filestore/db_name"
+        read -p "Does odoo.conf have custom data directory? (y/n) " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]
+        then
+            read -p "Enter the full Odoo filestore directory path (e.g., /home/odoo/.local/share/Odoo/filestore/db_name): " FILENAMES_PATH
+        else
+            read -p "Enter Odoo's user home directory path (e.g., /home/odoo/): " FILENAMES_PATH
+            FILENAMES_PATH="$FILENAMES_PATH/.local/share/Odoo/filestore/$DB_NAME"
+        fi
+                
+        if [ -n "$FILENAMES_PATH" ] && [ -d "$(dirname "$FILENAMES_PATH")" ]; then
+            # The destination directory must exist before moving the filestore
+            mv "$TEMP_DIR/filestore" "$FILENAMES_PATH"
+            echo "Moved filestore to '$FILENAMES_PATH'."
+        else
+            echo "Warning: Could not determine Odoo filestore path or destination directory does not exist. Filestore not restored."
+            exit 1
+        fi
+    fi
+
+elif [[ "$DUMP_FILE" == *.sql ]]; then
+    # Raw SQL dump (older Odoo versions)
+    echo "Processing raw SQL dump..."
+    psql -q --dbname="$DB_NAME" -f "$DUMP_FILE"
+
+else
+    # Odoo 7.0- binary format
+    echo "Processing Odoo 7.0- binary dump..."
+    pg_restore --no-owner --dbname="$DB_NAME" "$DUMP_FILE"
+
+fi
+
+echo "Restoration complete for database '$DB_NAME'."
