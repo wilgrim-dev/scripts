@@ -1,0 +1,101 @@
+#!/bin/bash
+
+# --- Configuration ---
+# $HOME/odoo_backups will always be writeable by the current user
+BACKUP_DIR="$HOME/odoo_backups" 
+TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
+
+# --- Pre-Flight Checks ---
+
+# 1. Ensure backup directory exists
+mkdir -p "$BACKUP_DIR" || { echo "Failed to create $BACKUP_DIR"; exit 1; }
+
+# 2. Check for jq (essential for manifest)
+if ! command -v jq &> /dev/null; then
+    echo "ERROR: 'jq' not found. Install it: sudo apt install jq"
+    exit 1
+fi
+
+# 3. Simple Disk Space Check (Requires 1GB minimum to even start)
+FREE_SPACE=$(df "$HOME" | awk 'NR==2 {print $4}')
+if [ "$FREE_SPACE" -lt 1048576 ]; then
+    echo "ERROR: Less than 1GB free space on disk. Aborting."
+    exit 1
+fi
+
+# --- Script Logic ---
+
+TEMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TEMP_DIR"' EXIT
+
+echo "--- Odoo Optimized Backup Started ---"
+
+# Step 1: Database Info
+read -p "Enter the Odoo database name: " DB_NAME
+if ! psql -lqt | cut -d \| -f 1 | grep -qw "$DB_NAME"; then
+    echo "Error: Database '$DB_NAME' does not exist."
+    exit 1
+fi
+
+# Step 2: Stream Database Dump (Straight to temp folder)
+echo "Dumping database '$DB_NAME'..."
+pg_dump --no-owner --format=plain --file="$TEMP_DIR/dump.sql" "$DB_NAME"
+
+# Step 3: Identify Filestore
+read -p "Does odoo.conf have custom data directory? (y/n) " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    read -p "Enter full filestore path: " ODOO_FILESTORE
+else
+    # Default path using the database name
+    ODOO_FILESTORE="$HOME/.local/share/Odoo/filestore/$DB_NAME"
+    echo "Defaulting to: $ODOO_FILESTORE"
+fi
+
+if [ ! -d "$ODOO_FILESTORE" ]; then
+    echo "Error: Filestore directory not found at $ODOO_FILESTORE"
+    exit 1
+fi
+
+# Step 4: Generate manifest.json (Used by Odoo for restores)
+echo "Generating manifest.json..."
+MAJOR_VERSION=$(psql -d "$DB_NAME" -t -A -c "SELECT latest_version FROM ir_module_module WHERE name = 'base';" | cut -d'.' -f1,2)
+PG_VERSION=$(psql -d "$DB_NAME" -t -A -c "SELECT substring(version() FROM 'PostgreSQL ([0-9]+\.[0-9]+)');")
+MODULES_JSON=$(psql -d "$DB_NAME" -t -A -c "SELECT COALESCE(jsonb_object_agg(name, latest_version), '{}') FROM ir_module_module WHERE state = 'installed';")
+
+jq -n \
+  --arg db_name "$DB_NAME" \
+  --arg version "${MAJOR_VERSION:-14.0}" \
+  --arg pg_version "${PG_VERSION:-unknown}" \
+  --argjson modules "$MODULES_JSON" \
+  '{
+    odoo_dump: "1",
+    db_name: $db_name,
+    version: $version,
+    version_info: [($version | split(".")[0] | tonumber), ($version | split(".")[1] | tonumber), 0, "final", 0, ""],
+    major_version: $version,
+    pg_version: $pg_version,
+    modules: $modules
+  }' > "$TEMP_DIR/manifest.json"
+
+# Step 5: Final Archiving (The "Space-Saving" Streaming Step)
+BACKUP_PATH="$BACKUP_DIR/${DB_NAME}_$TIMESTAMP.tar.gz"
+
+echo "Creating compressed archive at $BACKUP_PATH..."
+
+
+
+# We pull from TEMP_DIR and the original Filestore simultaneously to avoid copying
+tar -czf "$BACKUP_PATH" \
+    -C "$TEMP_DIR" dump.sql manifest.json \
+    -C "$(dirname "$ODOO_FILESTORE")" "$(basename "$ODOO_FILESTORE")"
+
+if [ $? -eq 0 ]; then
+    echo "-------------------------------------------"
+    echo "SUCCESS: Backup created."
+    echo "Location: $BACKUP_PATH"
+    du -sh "$BACKUP_PATH"
+else
+    echo "FAILURE: Backup failed. Likely ran out of disk space during compression."
+    exit 1
+fi

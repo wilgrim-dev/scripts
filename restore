@@ -1,0 +1,92 @@
+#!/bin/bash
+
+# Exit immediately if a command exits with a non-zero status.
+set -e
+
+# --- Configuration ---
+DB_TEMPLATE="template0"
+# Automatically detect current user's Odoo filestore base path
+DEFAULT_ODOO_BASE="$HOME/.local/share/Odoo/filestore"
+
+# --- Function to check if a database exists ---
+function db_exists() {
+  local dbname="$1"
+  psql --dbname=postgres -t -c "SELECT 1 FROM pg_database WHERE datname='$dbname'" | grep -q 1
+}
+
+# --- Main Script Logic ---
+
+DB_NAME="$1"
+BACKUP_FILE="$2"
+
+if [ -z "$DB_NAME" ] || [ -z "$BACKUP_FILE" ]; then
+    echo "Usage: $0 <new_database_name> <backup_file.tar.gz>"
+    exit 1
+fi
+
+if [ ! -f "$BACKUP_FILE" ]; then
+    echo "Error: File '$BACKUP_FILE' not found."
+    exit 1
+fi
+
+# Step 1: Manage Existing Database
+if db_exists "$DB_NAME"; then
+    read -p "Database '$DB_NAME' already exists. Drop and replace? (y/n): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo "Dropping database '$DB_NAME'..."
+        dropdb "$DB_NAME"
+    else
+        echo "Aborted."
+        exit 1
+    fi
+fi
+
+echo "Creating database '$DB_NAME'..."
+createdb "$DB_NAME" --template="$DB_TEMPLATE" --encoding=UTF8
+
+# Step 2: Handle the Filestore (Ask before extracting to save time/space)
+echo "--- Filestore Configuration ---"
+read -p "Use default filestore path ($DEFAULT_ODOO_BASE/$DB_NAME)? (y/n) " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    FILENAMES_PATH="$DEFAULT_ODOO_BASE/$DB_NAME"
+else
+    read -p "Enter the full destination path for the filestore: " FILENAMES_PATH
+fi
+
+# Ensure parent directory exists
+mkdir -p "$(dirname "$FILENAMES_PATH")"
+
+# Step 3: Lean Restoration (Streaming)
+echo "Restoring data from '$BACKUP_FILE'..."
+
+# Create a small temp dir ONLY for the filestore extraction
+TEMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TEMP_DIR"' EXIT
+
+
+
+# A. Stream the SQL dump directly to psql (Zero temporary disk space used for SQL)
+echo "Streaming SQL dump to database..."
+tar -O -xf "$BACKUP_FILE" dump.sql | psql -q -d "$DB_NAME"
+
+# B. Extract the filestore
+echo "Extracting filestore..."
+if tar -tf "$BACKUP_FILE" | grep -q "^filestore/"; then
+    # Extract only the filestore folder
+    tar -xf "$BACKUP_FILE" -C "$TEMP_DIR" filestore/
+    
+    # Move it to the target location
+    if [ -d "$FILENAMES_PATH" ]; then
+        echo "Warning: Destination $FILENAMES_PATH already exists. Merging."
+    fi
+    mkdir -p "$FILENAMES_PATH"
+    cp -rl "$TEMP_DIR/filestore/." "$FILENAMES_PATH/"
+    echo "Filestore restored to $FILENAMES_PATH"
+else
+    echo "Note: No filestore found in archive, skipping."
+fi
+
+echo "-------------------------------------------"
+echo "SUCCESS: Restoration complete for '$DB_NAME'."
